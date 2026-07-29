@@ -1,9 +1,12 @@
 # Binaries
+# NOTE: patterns are root-anchored (leading slash) so they only match compiled
+# binaries at the repo root, NOT the cmd/listener, cmd/pgwriter, cmd/simulator
+# SOURCE directories. A bare "listener" would match a dir of that name anywhere.
 /bin/
 *.exe
-listener
-pgwriter
-simulator
+/listener
+/pgwriter
+/simulator
 
 # Local env files (never commit secrets/credentials)
 deploy/*.env
