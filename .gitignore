@@ -1,0 +1,19 @@
+# Binaries
+/bin/
+*.exe
+listener
+pgwriter
+simulator
+
+# Local env files (never commit secrets/credentials)
+deploy/*.env
+!deploy/*.env.example
+
+# Go
+/vendor/
+
+# Editor / OS
+.vs/
+.idea/
+*.swp
+.DS_Store
