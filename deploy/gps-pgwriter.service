@@ -1,0 +1,33 @@
+[Unit]
+Description=GPS pgwriter -- Kafka gps.telemetry -> PostgreSQL
+Documentation=https://github.com/atlchirag/16104_GoLang
+After=network-online.target kafka.service postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=gps
+Group=gps
+# Holds the Postgres password; installed 640 gps:gps. systemd does NOT do
+# specifier expansion inside EnvironmentFile, so the %26 in the DSN survives
+# intact (it would not if this were an inline Environment= line).
+EnvironmentFile=/etc/gps/pgwriter.env
+ExecStart=/opt/gps/bin/pgwriter
+
+Restart=always
+RestartSec=5
+
+LimitNOFILE=65535
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gps-pgwriter
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/gps
+
+[Install]
+WantedBy=multi-user.target

@@ -72,3 +72,44 @@ func (c *chunkReader) Read(p []byte) (int, error) {
 	c.pos += n
 	return n, nil
 }
+
+// wireInput is a verbatim capture from device 862360075287248 (2026-08-01),
+// two consecutive frames as they arrive on the socket: no newline anywhere,
+// each bracketed by 0x01"ATL" ... "ATL"0x02 plus one trailing byte.
+var wireInput = []byte(
+	"\x20\x01ATL862360075287248,$GPRMC,082253,A,2838.0085,N,07713.3413,E,0.0,0,010826,,,*27,#01111011000010,0.00,-70.00,0,0.01,33,3.9,21,404,10,89d,dcb922bATL\x02\x41" +
+		"\x20\x01ATL862360075287248,$GPRMC,082303,A,2838.0085,N,07713.3413,E,0.0,0,010826,,,*23,#01111011000010,0.00,-70.00,0,0.01,33,3.9,20,404,10,89d,dcb922bATL\x02\x40")
+
+// TestWireFramingRealDevice is the regression test for the outage where a real
+// device connected, streamed for an hour, and produced nothing: the scanner was
+// waiting for a '\n' that devices never send.
+func TestWireFramingRealDevice(t *testing.T) {
+	// Chunk 149 is exactly one frame; 148 and 150 straddle the boundary, which
+	// is where a split function most often breaks.
+	for _, chunk := range []int{1, 7, 148, 149, 150, 4096} {
+		r := &chunkReader{data: wireInput, chunk: chunk}
+		s := NewFrameScanner(r, 64*1024)
+		var got []string
+		for s.Scan() {
+			got = append(got, string(s.Bytes()))
+		}
+		if err := s.Err(); err != nil {
+			t.Fatalf("chunk=%d: scanner error: %v", chunk, err)
+		}
+		if len(got) != 2 {
+			t.Fatalf("chunk=%d: got %d frames, want 2: %q", chunk, len(got), got)
+		}
+		// The trailing "ATL"0x02<byte> must not survive onto the cell-id field.
+		for i, f := range got {
+			if bytes.Contains([]byte(f), frameEnd) {
+				t.Errorf("chunk=%d frame %d still carries the end marker: %q", chunk, i, f)
+			}
+			if imei := PeekIMEI(f); imei != "862360075287248" {
+				t.Errorf("chunk=%d frame %d: IMEI = %q, want 862360075287248", chunk, i, imei)
+			}
+			if _, err := ParseGPRMC(f); err != nil {
+				t.Errorf("chunk=%d frame %d: ParseGPRMC failed: %v", chunk, i, err)
+			}
+		}
+	}
+}

@@ -30,12 +30,27 @@ func main() {
 	file := flag.String("file", "", "file of packets to replay (one per line); default sends the built-in packet")
 	n := flag.Int("n", 1, "number of times to send when using the built-in packet")
 	delay := flag.Duration("delay", 200*time.Millisecond, "delay between packets")
+	date := flag.String("date", "today", `GPRMC date stamp to send: "today", "keep" (use the capture's own date), or an explicit ddMMyy such as 010826`)
 	flag.Parse()
 
 	packets, err := loadPackets(*file, *n)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "load packets:", err)
 		os.Exit(1)
+	}
+
+	// The capture was recorded on 27/05/26, and pgwriter picks the monthly table
+	// from the packet's own date -- so replaying it verbatim writes into
+	// tbl_telemetry_may26, not the current month. Retarget it by default.
+	if *date != "keep" {
+		stamp := *date
+		if stamp == "today" {
+			stamp = time.Now().Format("020106") // ddMMyy
+		}
+		for i := range packets {
+			packets[i] = retargetDate(packets[i], stamp)
+		}
+		fmt.Printf("date stamp set to %s\n", stamp)
 	}
 
 	conn, err := net.Dial("tcp", *addr)
@@ -91,6 +106,28 @@ func loadPackets(file string, n int) ([]string, error) {
 		return nil, fmt.Errorf("no $GPRMC packets found in %s", file)
 	}
 	return out, nil
+}
+
+// retargetDate rewrites the GPRMC date stamp (ddMMyy) in one packet. That field
+// is f[9] after the "$GPRMC" marker -- the same index ParseGPRMC reads -- and it
+// decides which monthly table pgwriter writes to. Nothing verifies the NMEA
+// checksum (neither the .NET service nor our parser), so editing the field in
+// place leaves the packet perfectly acceptable.
+//
+// Packets without a $GPRMC marker, or with too few fields, are returned
+// untouched: the pipeline should get its own chance to reject them.
+func retargetDate(packet, ddMMyy string) string {
+	idx := strings.Index(packet, "$GPRMC")
+	if idx < 0 {
+		return packet
+	}
+	head := packet[:idx+len("$GPRMC")]
+	f := strings.Split(packet[idx+len("$GPRMC"):], ",")
+	if len(f) < 10 {
+		return packet
+	}
+	f[9] = ddMMyy
+	return head + strings.Join(f, ",")
 }
 
 func envOr(k, def string) string {

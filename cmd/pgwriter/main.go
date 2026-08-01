@@ -9,6 +9,22 @@
 //	CONSUMER_GROUP        default "pg-writer"
 //	POSTGRES_DSN          default "postgres://postgres:root@localhost:5432/atltracking"
 //	PGWRITER_UTC_OFFSET   minutes added to gps_time for table selection, default 330 (India)
+//
+// The defaults above are the LOCAL DEV values, so `go run ./cmd/pgwriter` works
+// on a developer machine with no setup. They are deliberately NOT the
+// production values -- credentials must not live in this repo, which is public.
+//
+// Two environments, switched by which env file you load:
+//
+//	PRODUCTION (atlvm-6)   deploy/pgwriter.env        Postgres role `newtrack`
+//	                       on 192.168.23.135:5432. That host does NOT accept
+//	                       "localhost" -- Postgres is not bound to loopback there.
+//	LOCAL DEV              deploy/pgwriter.local.env  postgres@localhost.
+//
+// Both files are gitignored. To switch, either load the other file or comment
+// or uncomment the POSTGRES_DSN block inside the one you use:
+//
+//	set -a; source deploy/pgwriter.env; set +a; ./pgwriter
 package main
 
 import (

@@ -1,0 +1,42 @@
+[Unit]
+Description=Apache Kafka (KRaft, single node)
+Documentation=https://kafka.apache.org/documentation/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kafka
+Group=kafka
+
+# Adjust JAVA_HOME if you installed a different JDK (must be 17+ for Kafka 4.x).
+Environment="JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64"
+
+# Kafka's JVM heap. Kafka does NOT want a big heap -- it relies on the OS page
+# cache for reads/writes, so leave most RAM to the kernel (and to Postgres,
+# which shares this box). 2-4G is right for our volume.
+Environment="KAFKA_HEAP_OPTS=-Xmx2G -Xms2G"
+
+# Where Kafka writes its OWN application logs (not the message data; that is
+# log.dirs in server.properties). Without this it writes into /opt/kafka/logs.
+Environment="LOG_DIR=/var/log/kafka"
+
+ExecStart=/opt/kafka/bin/kafka-server-start.sh /etc/kafka/server.properties
+ExecStop=/opt/kafka/bin/kafka-server-stop.sh
+
+Restart=on-failure
+RestartSec=5
+
+# A clean Kafka shutdown flushes and closes every log segment; do not let
+# systemd SIGKILL it early or the next start does a slow recovery scan.
+TimeoutStopSec=180
+
+# Kafka holds one file handle per log segment plus one per connection. The
+# default 1024 is far too low and shows up as "Too many open files".
+LimitNOFILE=100000
+
+# kafka-server-stop.sh terminates via SIGTERM; the JVM exits 143 (128+15).
+SuccessExitStatus=143
+
+[Install]
+WantedBy=multi-user.target

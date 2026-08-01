@@ -7,6 +7,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -119,32 +120,39 @@ func (s *Store) InsertTelemetry(ctx context.Context, m *model.TelemetryMessage, 
 	_, err := s.pool.Exec(ctx, sql,
 		serviceID, m.GPSTime, validity,
 		m.Position.Latitude, m.Position.LatDir, m.Position.Longitude, m.Position.LonDir,
-		m.Position.SpeedKmh, m.Position.Orientation, deref(m.Position.Variation), "",
+		m.Position.SpeedKmh, m.Position.Orientation, numStr(m.Position.Variation), "",
 		m.IO.I1MainPower, m.IO.I2Ignition, m.IO.I3SOS, m.IO.I4, m.IO.I5, /*i6 literal 0*/
 		m.IO.I7, m.IO.I8Door, m.IO.I9HarshSpeeding, m.IO.I10HarshBraking, m.IO.I11ArmDisarm,
 		m.IO.I12Sleep, m.IO.I13Relay, m.IO.I14Accelerometer, m.IO.I6AC, /* -> i15 */
-		m.Vehicle.Odometer, derefF(m.Vehicle.BatteryVoltage), derefI(m.Network.SignalStrength),
+		m.Vehicle.Odometer, numStr(m.Vehicle.BatteryVoltage), intStr(m.Network.SignalStrength),
 		m.Network.MobileCountryCode, m.Network.MobileNetworkCode, m.Network.LocationAreaCode, m.Network.CellID,
 		m.Network.FirmwareVersion, string(rawJSON),
 	)
 	return err
 }
 
-func deref(p *float64) any {
+// numStr and intStr render a numeric value as text, keeping nil as SQL NULL.
+//
+// variation, battery_voltage and signal_strength are numeric in our model but
+// varchar(500) in the database, because the .NET service wrote them with string
+// concatenation. pgx refuses to encode a float64 or int64 into a varchar
+// parameter ("cannot find encode plan") rather than coercing silently, so the
+// conversion has to be explicit here. Changing the columns to a numeric type
+// instead would break the existing reporting queries and the .NET writer during
+// the parallel-run phase, so we match the schema as it is.
+//
+// FormatFloat with precision -1 emits the shortest representation that round
+// trips (4.2 stays "4.2", not "4.2000000000000002").
+func numStr(p *float64) any {
 	if p == nil {
 		return nil
 	}
-	return *p
+	return strconv.FormatFloat(*p, 'f', -1, 64)
 }
-func derefF(p *float64) any {
+
+func intStr(p *int64) any {
 	if p == nil {
 		return nil
 	}
-	return *p
-}
-func derefI(p *int64) any {
-	if p == nil {
-		return nil
-	}
-	return *p
+	return strconv.FormatInt(*p, 10)
 }

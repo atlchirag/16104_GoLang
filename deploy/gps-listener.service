@@ -1,0 +1,36 @@
+[Unit]
+Description=GPS AtlantaNew TCP listener (port 16104) -> Kafka
+Documentation=https://github.com/atlchirag/16104_GoLang
+After=network-online.target kafka.service
+Wants=network-online.target
+# Kafka must be up to accept produces. Not Requires= -- if Kafka dies we still
+# want the listener accepting sockets so devices are not left unable to connect.
+After=kafka.service
+
+[Service]
+Type=simple
+User=gps
+Group=gps
+EnvironmentFile=/etc/gps/listener.env
+ExecStart=/opt/gps/bin/listener
+
+Restart=always
+RestartSec=3
+
+# maxConnectionNumber in the .NET service was 10000; one fd per device socket
+# plus Kafka connections. The 1024 default would cap us far below that.
+LimitNOFILE=65535
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gps-listener
+
+# Hardening: this process only needs to accept TCP and talk to Kafka.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/gps
+
+[Install]
+WantedBy=multi-user.target
