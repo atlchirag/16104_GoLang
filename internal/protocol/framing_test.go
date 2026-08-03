@@ -3,6 +3,7 @@ package protocol
 import (
 	"bytes"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -73,12 +74,16 @@ func (c *chunkReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// wireInput is a verbatim capture from device 862360075287248 (2026-08-01),
-// two consecutive frames as they arrive on the socket: no newline anywhere,
-// each bracketed by 0x01"ATL" ... "ATL"0x02 plus one trailing byte.
+// wireInput is a verbatim capture from device 862360075287248, three frames as
+// they arrive on the socket -- no newline anywhere. Crucially the head/tail
+// control bytes DIFFER between frames (0x01/0x02 and 0x03/0x04): a real
+// 6-packet segment contained one of the former and five of the latter, so an
+// implementation that hard-codes either one silently merges frames and drops
+// telemetry. Frames 2 and 3 also carry a 0x04 tail after a 0x03 head.
 var wireInput = []byte(
 	"\x20\x01ATL862360075287248,$GPRMC,082253,A,2838.0085,N,07713.3413,E,0.0,0,010826,,,*27,#01111011000010,0.00,-70.00,0,0.01,33,3.9,21,404,10,89d,dcb922bATL\x02\x41" +
-		"\x20\x01ATL862360075287248,$GPRMC,082303,A,2838.0085,N,07713.3413,E,0.0,0,010826,,,*23,#01111011000010,0.00,-70.00,0,0.01,33,3.9,20,404,10,89d,dcb922bATL\x02\x40")
+		"\x20\x03ATL862360075287248,$GPRMC,082303,A,2838.0085,N,07713.3413,E,0.0,0,010826,,,*23,#01111011000010,0.00,-70.00,0,0.01,33,3.9,20,404,10,89d,dcb922aATL\x04\x38" +
+		"\x20\x03ATL862360075287248,$GPRMC,082313,A,2838.0098,N,07713.3413,E,0.0,0,010826,,,*2E,#01111011000010,0.00,-70.00,0,0.02,33,4.0,21,404,10,89d,dcb922aATL\x04\x46")
 
 // TestWireFramingRealDevice is the regression test for the outage where a real
 // device connected, streamed for an hour, and produced nothing: the scanner was
@@ -96,12 +101,17 @@ func TestWireFramingRealDevice(t *testing.T) {
 		if err := s.Err(); err != nil {
 			t.Fatalf("chunk=%d: scanner error: %v", chunk, err)
 		}
-		if len(got) != 2 {
-			t.Fatalf("chunk=%d: got %d frames, want 2: %q", chunk, len(got), got)
+		if len(got) != 3 {
+			t.Fatalf("chunk=%d: got %d frames, want 3: %q", chunk, len(got), got)
 		}
-		// The trailing "ATL"0x02<byte> must not survive onto the cell-id field.
 		for i, f := range got {
-			if bytes.Contains([]byte(f), frameEnd) {
+			// Exactly one $GPRMC per frame: more means frames were merged,
+			// which is how the trailer variation showed up in production.
+			if n := strings.Count(f, "$GPRMC"); n != 1 {
+				t.Errorf("chunk=%d frame %d: %d x $GPRMC, want 1 (frames merged): %q", chunk, i, n, f)
+			}
+			// The trailer must not survive onto the last field (cell id).
+			if strings.Contains(f, "ATL\x02") || strings.Contains(f, "ATL\x04") {
 				t.Errorf("chunk=%d frame %d still carries the end marker: %q", chunk, i, f)
 			}
 			if imei := PeekIMEI(f); imei != "862360075287248" {

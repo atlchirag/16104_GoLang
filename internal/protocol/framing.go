@@ -19,11 +19,13 @@ import (
 //  1. ON THE WIRE (real devices). Confirmed by packet capture from IMEI
 //     862360075287248 on 2026-08-01, every frame looks like:
 //
-//     0x20? 0x01 "ATL" <15-digit IMEI> "," "$GPRMC" ... <payload> "ATL" 0x02 <1 byte>
+//     0x20 <ctrl> "ATL" <15-digit IMEI> "," "$GPRMC" ... <payload> "ATL" <ctrl+1> <byte>
 //
-//     so the terminator is the literal "ATL" followed by 0x02, plus one
-//     trailing byte (a counter or checksum; it varied 0x40/0x41 across frames
-//     and is not interpreted here). Devices send NO newline.
+//     Both the head and tail control bytes VARY -- observed head 0x01 and 0x03
+//     with matching tails 0x02 and 0x04 -- so neither can be hard-coded. What
+//     is invariant is that the closing "ATL" is followed by a byte below 0x20,
+//     while the opening one is followed by the IMEI's digits. See
+//     indexFrameEnd. Devices send NO newline.
 //
 //     The .NET CustomReceiveFilter had no delimiter at all -- it assumed one
 //     socket read == one packet -- which is finding D5. There was therefore
@@ -38,10 +40,40 @@ import (
 // retained because extractIMEI, mirroring the .NET Substring(4, 15), counts on
 // those four bytes being present.
 
-// frameEnd is the on-the-wire terminator: the literal "ATL" then 0x02. One
-// further byte follows it and is consumed but not emitted. "ATL" alone is not
-// enough -- payloads legitimately contain "ATLTPMS" and similar.
-var frameEnd = []byte("ATL\x02")
+// atl is the marker that both opens and closes a frame. Which one it is depends
+// entirely on the byte that follows it:
+//
+//	"ATL" + digits        -> frame START ("ATL862360075287248,$GPRMC,...")
+//	"ATL" + control byte  -> frame END   (trailer: 1 control byte + 1 ASCII byte)
+//
+// Verified over a 6-packet TCP segment from device 862360075287248: every one
+// of the 12 "ATL" occurrences was followed by either "86" (the IMEI) or a byte
+// below 0x20. Matching on "ATL" alone would false-positive on payload content
+// such as "ATLTPMS".
+var atl = []byte("ATL")
+
+// indexFrameEnd returns the offset of the frame terminator in data, or -1 if
+// there is not yet enough data to identify one.
+//
+// Returning -1 for "ATL" sitting at the very end of the buffer is deliberate:
+// we cannot yet tell a terminator from the start of the next frame, so the
+// caller must read more bytes rather than guess.
+func indexFrameEnd(data []byte) int {
+	for from := 0; ; {
+		i := bytes.Index(data[from:], atl)
+		if i < 0 {
+			return -1
+		}
+		i += from
+		if i+len(atl) >= len(data) {
+			return -1 // next byte not read yet -- undecidable
+		}
+		if data[i+len(atl)] < 0x20 {
+			return i
+		}
+		from = i + 1 // a start marker; keep looking
+	}
+}
 
 // NewFrameScanner wraps a reader with the packet split function and a bounded
 // buffer. maxFrame caps a single packet so a misbehaving or malicious device
@@ -69,12 +101,12 @@ func SplitPackets(data []byte, atEOF bool) (advance int, token []byte, err error
 
 	// Whichever delimiter comes first wins, so a stream that mixes the two
 	// (a log replay piped at a live listener, say) still frames correctly.
-	end := bytes.Index(data, frameEnd)
+	end := indexFrameEnd(data)
 	nl := bytes.IndexByte(data, '\n')
 
 	if end >= 0 && (nl < 0 || end < nl) {
-		// One trailing byte follows the 0x02 and belongs to this frame.
-		advance := end + len(frameEnd) + 1
+		// Trailer is "ATL" + 1 control byte + 1 ASCII byte.
+		advance := end + len(atl) + 2
 		if advance > len(data) {
 			if !atEOF {
 				return 0, nil, nil // trailer byte has not arrived yet
