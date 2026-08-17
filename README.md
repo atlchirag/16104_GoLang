@@ -75,11 +75,17 @@ go run ./cmd/simulator                        # built-in real packet
 # go run ./cmd/simulator -file /path/to/864180055638907.txt
 
 # 7. Verify.
-psql -d atltracking -c "SELECT sys_service_id, gps_time, gps_latitude, gps_longitude, tel_odometer FROM tbl_telemetry_may26;"
+psql -d atltracking -c "SELECT sys_service_id, gps_time, gps_latitude, gps_longitude, tel_odometer FROM tbl_telemetry_27052026;"
 ```
 
+Telemetry lands in one table per day, `tbl_telemetry_<ddmmyyyy>`, chosen from the
+packet's own `gps_time` at +330. Those tables are created the night before by
+the **daily-telemetry** service (`atlchirag/Daily_Telemetry`), which must be
+installed and running for pgwriter to have anywhere to write. Send the
+simulator with `-date keep` to hit the captured day, or let it retarget to today.
+
 You should see the simulator print `ack=0xAA`, the consumer log `inserted`, and
-one row in `tbl_telemetry_may26`. Send it again — still one row (idempotency).
+one row in `tbl_telemetry_27052026`. Send it again — still one row (idempotency).
 
 ## Status
 

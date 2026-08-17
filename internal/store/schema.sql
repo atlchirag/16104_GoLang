@@ -27,12 +27,18 @@ INSERT INTO tbl_services (sys_device_id, port_no)
     ON CONFLICT DO NOTHING;
 
 -- ---------------------------------------------------------------------------
--- Monthly telemetry table. The captured packet's gps_time is 2026-05-27, which
--- (with the +330 India offset) lands in may26. In production these tables are
--- created by a scheduled job (plan section 4.10, change 3); for testing we make
--- may26 explicitly.
+-- Daily telemetry table. The captured packet's gps_time is 2026-05-27, which
+-- (with the +330 India offset) lands in tbl_telemetry_27052026.
+--
+-- In production these tables are created the night before by the
+-- daily-telemetry service (atlchirag/Daily_Telemetry), which emits the
+-- full 56-column schema plus the tbl_latest_telemetry trigger. What follows is
+-- only the cut-down subset local tests need; do not treat it as the production
+-- shape. To make one for a different day locally:
+--
+--   daily-telemetry -dry-run -date 2026-05-27 | psql -d atltracking
 -- ---------------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS tbl_telemetry_may26 (
+CREATE TABLE IF NOT EXISTS tbl_telemetry_27052026 (
     id                    bigserial PRIMARY KEY,
     sys_service_id        bigint       NOT NULL,
     sys_proc_time         timestamptz  NOT NULL,
@@ -61,5 +67,5 @@ CREATE TABLE IF NOT EXISTS tbl_telemetry_may26 (
 
 -- Idempotency: at-least-once delivery means the same packet can arrive twice.
 -- This unique key makes ON CONFLICT DO NOTHING a no-op on redelivery.
-CREATE UNIQUE INDEX IF NOT EXISTS ux_tbl_telemetry_may26_service_gpstime
-    ON tbl_telemetry_may26 (sys_service_id, gps_time);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_tbl_telemetry_27052026_service_gpstime
+    ON tbl_telemetry_27052026 (sys_service_id, gps_time);

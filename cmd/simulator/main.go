@@ -39,9 +39,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The capture was recorded on 27/05/26, and pgwriter picks the monthly table
+	// The capture was recorded on 27/05/26, and pgwriter picks the daily table
 	// from the packet's own date -- so replaying it verbatim writes into
-	// tbl_telemetry_may26, not the current month. Retarget it by default.
+	// tbl_telemetry_27052026, not today's table (which is the only one the
+	// scheduler has created). Retarget it by default.
 	if *date != "keep" {
 		stamp := *date
 		if stamp == "today" {

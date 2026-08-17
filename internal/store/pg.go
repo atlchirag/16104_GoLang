@@ -8,7 +8,6 @@ import (
 	"context"
 	"fmt"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -33,7 +32,7 @@ type cacheEntry struct {
 const cacheTTL = 5 * time.Minute
 
 // New opens a pgx pool. utcOffsetMin is added to gps_time when choosing the
-// monthly table name, matching the .NET tableMonth logic (India = +330).
+// daily table name, carrying over the .NET tableMonth offset (India = +330).
 func New(ctx context.Context, dsn string, utcOffsetMin int) (*Store, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -75,10 +74,15 @@ func (s *Store) ResolveServiceID(ctx context.Context, imei string) (int64, error
 	return id, nil
 }
 
-// tableFor returns the monthly telemetry table name, e.g. tbl_telemetry_may26.
+// tableFor returns the daily telemetry table name, e.g. tbl_telemetry_17082026.
+//
+// Telemetry used to land in monthly tables (tbl_telemetry_aug26); it is now one
+// table per day. The tables are created the night before by the daily-telemetry
+// service, which derives the same ddmmyyyy suffix from the same +330 offset —
+// the two MUST agree, or this insert targets a table nobody created.
 func (s *Store) tableFor(gpsTime time.Time) string {
 	local := gpsTime.Add(time.Duration(s.utcOffsetMin) * time.Minute)
-	return "tbl_telemetry_" + strings.ToLower(local.Format("Jan06"))
+	return "tbl_telemetry_" + local.Format("02012006")
 }
 
 // InsertTelemetry writes one telemetry row idempotently. serviceID must already
