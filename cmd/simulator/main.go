@@ -98,7 +98,7 @@ func loadPackets(file string, n int) ([]string, error) {
 	var out []string
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimRight(line, "\r")
-		// Skip the .NET log's timestamp lines (e.g. "5/27/2026 1:04:16 PM").
+
 		if strings.Contains(line, "$GPRMC") {
 			out = append(out, line)
 		}
@@ -109,14 +109,6 @@ func loadPackets(file string, n int) ([]string, error) {
 	return out, nil
 }
 
-// retargetDate rewrites the GPRMC date stamp (ddMMyy) in one packet. That field
-// is f[9] after the "$GPRMC" marker -- the same index ParseGPRMC reads -- and it
-// decides which monthly table pgwriter writes to. Nothing verifies the NMEA
-// checksum (neither the .NET service nor our parser), so editing the field in
-// place leaves the packet perfectly acceptable.
-//
-// Packets without a $GPRMC marker, or with too few fields, are returned
-// untouched: the pipeline should get its own chance to reject them.
 func retargetDate(packet, ddMMyy string) string {
 	idx := strings.Index(packet, "$GPRMC")
 	if idx < 0 {

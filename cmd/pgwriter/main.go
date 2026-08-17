@@ -11,13 +11,12 @@
 //	PGWRITER_UTC_OFFSET   minutes added to gps_time for table selection, default 330 (India)
 //
 // The defaults above are the LOCAL DEV values, so `go run ./cmd/pgwriter` works
-// on a developer machine with no setup. They are deliberately NOT the
-// production values -- credentials must not live in this repo, which is public.
+// on a developer machine with no setup.
 //
 // Two environments, switched by which env file you load:
 //
 //	PRODUCTION (atlvm-6)   deploy/pgwriter.env        Postgres role `newtrack`
-//	                       on 192.168.23.135:5432. That host does NOT accept
+//	                        That host does NOT accept
 //	                       "localhost" -- Postgres is not bound to loopback there.
 //	LOCAL DEV              deploy/pgwriter.local.env  postgres@localhost.
 //

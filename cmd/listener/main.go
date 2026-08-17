@@ -55,8 +55,7 @@ func main() {
 
 	srv := &server{log: log, producer: producer, instance: instance, port: portOf(addr)}
 
-	// Graceful shutdown: stop accepting, let in-flight connections finish,
-	// then flush the producer (plan section 4.4.7).
+	// Graceful shutdown
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -108,8 +107,7 @@ func (s *server) handleConn(ctx context.Context, conn net.Conn) {
 	for scanner.Scan() {
 		raw := string(scanner.Bytes())
 
-		// 1) Acknowledge immediately, before any other work, exactly like the
-		//    .NET code sent 0xAA first.
+		// 1) Acknowledge immediately, before any other work
 		if _, err := conn.Write([]byte{0xAA}); err != nil {
 			s.log.Warn("ack write failed", "remote", remote, "err", err)
 			return
