@@ -87,6 +87,50 @@ simulator with `-date keep` to hit the captured day, or let it retarget to today
 You should see the simulator print `ack=0xAA`, the consumer log `inserted`, and
 one row in `tbl_telemetry_27052026`. Send it again — still one row (idempotency).
 
+## Telemetry table naming: daily or monthly
+
+This is the only port in the family that can write **monthly** tables, and it is
+switchable without a rebuild:
+
+```
+TELEMETRY_TABLE_MODE=daily     tbl_telemetry_25092026   (default)
+TELEMETRY_TABLE_MODE=monthly   tbl_telemetry_sep26
+```
+
+Anything unrecognised falls back to `daily`, never silently to monthly.
+`pgwriter` logs the mode it started in, and warns loudly when monthly is active.
+
+**Currently set to `monthly` on atlvm-6** (2026-09-25) at the data owner's
+request, for a test. Every other port writes daily, unconditionally.
+
+### The catch, and it has a date on it
+
+`daily-telemetry` creates the next **day's** table at 23:55 IST. **Nothing
+creates monthly tables** — they are leftovers from the SQL Server era. So in
+monthly mode the target table must already exist, and must carry a unique index
+over `(gps_time, sys_service_id)` or `ON CONFLICT` fails with 42P10 and every
+row is diverted to the DLQ.
+
+`tbl_telemetry_sep26` exists and its
+`tbl_telemetry_sep26_sys_service_id_gps_time_idx` is UNIQUE over
+`(sys_service_id, gps_time)` — Postgres infers `ON CONFLICT` by column set, not
+order, so it matches. Verified with a real insert inside a rolled-back
+transaction before the switch.
+
+**`tbl_telemetry_oct26` does NOT exist.** Because the table name is derived from
+`gps_time + 330 minutes`, writes start targeting it at **2026-09-30 18:30 UTC**.
+From that moment, in monthly mode, every row fails with 42P01 and lands in
+`gps.dlq` (30-day retention, so replayable). Before then, either create
+`tbl_telemetry_oct26` with that unique index, or switch back:
+
+```bash
+sudo sed -i 's/^TELEMETRY_TABLE_MODE=.*/TELEMETRY_TABLE_MODE=daily/' /etc/gps/pgwriter.env
+sudo systemctl restart gps-pgwriter
+```
+
+Rolling back needs no rebuild and no redeploy — it is an env flip and a restart.
+The previous binary is kept as `/opt/gps/bin/pgwriter.daily.bak-<timestamp>`.
+
 ## Status
 
 Done: TCP framing (fixes D5), GPRMC + I/O parsing, Kafka produce (`gps.raw` +

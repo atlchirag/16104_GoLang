@@ -6,19 +6,35 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/wiziot/gps-platform/internal/model"
+)
+
+// Table naming schemes for the telemetry table.
+//
+// The pipeline moved from monthly to daily tables in August 2026 (see tableFor).
+// TableMonthly exists so this port can be put back on monthly tables without a
+// rebuild -- it is the only port in the family that can. Everything else writes
+// daily, unconditionally.
+const (
+	TableDaily   = "daily"
+	TableMonthly = "monthly"
 )
 
 // Store owns the connection pool and the IMEI -> service_id cache.
 type Store struct {
 	pool         *pgxpool.Pool
 	utcOffsetMin int
+	tableMode    string
 
 	mu    sync.RWMutex
 	cache map[string]cacheEntry // imei -> service_id
@@ -32,8 +48,9 @@ type cacheEntry struct {
 const cacheTTL = 5 * time.Minute
 
 // New opens a pgx pool. utcOffsetMin is added to gps_time when choosing the
-// daily table name, carrying over the .NET tableMonth offset (India = +330).
-func New(ctx context.Context, dsn string, utcOffsetMin int) (*Store, error) {
+// table name, carrying over the .NET tableMonth offset (India = +330).
+// tableMode is TableDaily or TableMonthly; anything else is treated as daily.
+func New(ctx context.Context, dsn string, utcOffsetMin int, tableMode string) (*Store, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
 		return nil, err
@@ -42,7 +59,20 @@ func New(ctx context.Context, dsn string, utcOffsetMin int) (*Store, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	return &Store{pool: pool, utcOffsetMin: utcOffsetMin, cache: map[string]cacheEntry{}}, nil
+	if tableMode != TableMonthly {
+		tableMode = TableDaily
+	}
+	return &Store{
+		pool:         pool,
+		utcOffsetMin: utcOffsetMin,
+		tableMode:    tableMode,
+		cache:        map[string]cacheEntry{},
+	}, nil
+}
+
+// TableMode reports which naming scheme is in force, for start-up logging.
+func (s *Store) TableMode() string {
+	return s.tableMode
 }
 
 func (s *Store) Close() { s.pool.Close() }
@@ -64,6 +94,11 @@ func (s *Store) ResolveServiceID(ctx context.Context, imei string) (int64, error
 		   FROM tbl_devices d
 		   JOIN tbl_services s ON s.sys_device_id = d.id
 		  WHERE d.imei = $1`, imei).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Distinguished from a database outage so the caller can divert the
+		// record instead of skipping it silently, which lost it outright.
+		return 0, fmt.Errorf("%w: %s", ErrUnknownIMEI, imei)
+	}
 	if err != nil {
 		return 0, err
 	}
@@ -74,14 +109,35 @@ func (s *Store) ResolveServiceID(ctx context.Context, imei string) (int64, error
 	return id, nil
 }
 
-// tableFor returns the daily telemetry table name, e.g. tbl_telemetry_17082026.
+// tableFor returns the telemetry table name for a packet's timestamp, in
+// whichever naming scheme is configured.
 //
-// Telemetry used to land in monthly tables (tbl_telemetry_aug26); it is now one
-// table per day. The tables are created the night before by the daily-telemetry
-// service, which derives the same ddmmyyyy suffix from the same +330 offset —
-// the two MUST agree, or this insert targets a table nobody created.
+//	daily    tbl_telemetry_17082026   ddmmyyyy   (the default, and what every
+//	                                              other port in the family uses)
+//	monthly  tbl_telemetry_aug26      mmmyy      (what the .NET service wrote,
+//	                                              and what this port used until
+//	                                              August 2026)
+//
+// Both derive the suffix from gps_time shifted by utcOffsetMin, matching the
+// .NET `tableMonth` expression.
+//
+// WHO CREATES THE TABLE differs between the two, and that is the thing that
+// bites:
+//
+//   - daily: the daily-telemetry service creates tomorrow's table at 23:55 IST
+//     from the same +330 offset. The two MUST agree or this insert targets a
+//     table nobody created.
+//   - monthly: NOTHING in this platform creates monthly tables any more; they
+//     are leftovers from the SQL Server era. Before switching to monthly,
+//     confirm the target month's table exists AND carries a unique index over
+//     (gps_time, sys_service_id) -- without it ON CONFLICT fails with 42P10 and
+//     every row is diverted to the DLQ.
 func (s *Store) tableFor(gpsTime time.Time) string {
 	local := gpsTime.Add(time.Duration(s.utcOffsetMin) * time.Minute)
+	if s.tableMode == TableMonthly {
+		// .NET wrote ToString("MMMyy").ToLower(), e.g. "sep26".
+		return "tbl_telemetry_" + strings.ToLower(local.Format("Jan06"))
+	}
 	return "tbl_telemetry_" + local.Format("02012006")
 }
 
@@ -134,6 +190,50 @@ func (s *Store) InsertTelemetry(ctx context.Context, m *model.TelemetryMessage, 
 	)
 	return err
 }
+
+// permanentCodes are SQLSTATEs where retrying the identical statement can only
+// fail the identical way. Retrying them forever blocks the Kafka partition
+// behind the offending record, so the caller must divert the record instead.
+//
+// 42P01 is the one that actually bit us in production: a device whose clock had
+// slipped to 2001 made tableFor pick tbl_telemetry_14122001, a daily table that
+// nobody had created, and the writer retried that batch for hours while every
+// packet behind it — including the well-dated ones — waited.
+//
+// Deliberately absent: connection failures, 40001 serialization_failure, 40P01
+// deadlock_detected, 53300 too_many_connections, 57014 query_canceled. Those
+// are transient and MUST keep their retry, since retrying is what makes them
+// recover.
+var permanentCodes = map[string]string{
+	"42P01": "undefined_table",
+	"42703": "undefined_column",
+	"42804": "datatype_mismatch",
+	"42883": "undefined_function",
+	"22001": "string_data_right_truncation",
+	"22003": "numeric_value_out_of_range",
+	"22007": "invalid_datetime_format",
+	"22008": "datetime_field_overflow",
+	"22P02": "invalid_text_representation",
+	"23502": "not_null_violation",
+	"23503": "foreign_key_violation",
+	"23514": "check_violation",
+}
+
+// IsPermanent reports whether err is a Postgres error that will recur on every
+// retry of the same row, and returns the condition name for logging.
+func IsPermanent(err error) (string, bool) {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return "", false
+	}
+	name, ok := permanentCodes[pgErr.Code]
+	return name, ok
+}
+
+// ErrUnknownIMEI reports that no service row exists for the device. It is a
+// permanent condition for the record: the row cannot be written without a
+// sys_service_id, and no amount of redelivery invents one.
+var ErrUnknownIMEI = errors.New("no service registered for imei")
 
 // numStr and intStr render a numeric value as text, keeping nil as SQL NULL.
 //

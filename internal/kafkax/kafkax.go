@@ -58,6 +58,23 @@ func (p *Producer) Publish(ctx context.Context, topic, key string, value []byte,
 	})
 }
 
+// PublishSync enqueues a record and blocks until the broker acknowledges it.
+//
+// The DLQ path uses this rather than Publish: a record is only dropped from the
+// main pipeline once it is durably in gps.dlq, so the caller may commit the
+// source offset immediately afterwards without risking silent loss.
+func (p *Producer) PublishSync(ctx context.Context, topic, key string, value []byte, headers map[string]string) error {
+	rec := &kgo.Record{
+		Topic: topic,
+		Key:   []byte(key),
+		Value: value,
+	}
+	for k, v := range headers {
+		rec.Headers = append(rec.Headers, kgo.RecordHeader{Key: k, Value: []byte(v)})
+	}
+	return p.cl.ProduceSync(ctx, rec).FirstErr()
+}
+
 // Flush blocks until all buffered records are delivered or ctx expires. Called
 // during graceful shutdown.
 func (p *Producer) Flush(ctx context.Context) error { return p.cl.Flush(ctx) }

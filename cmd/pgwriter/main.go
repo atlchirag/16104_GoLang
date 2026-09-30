@@ -9,6 +9,11 @@
 //	CONSUMER_GROUP        default "pg-writer"
 //	POSTGRES_DSN          default "postgres://postgres:root@localhost:5432/atltracking"
 //	PGWRITER_UTC_OFFSET   minutes added to gps_time for table selection, default 330 (India)
+//	TELEMETRY_TABLE_MODE  "daily" (default) or "monthly". Monthly restores the
+//	                      pre-August-2026 tbl_telemetry_<mmmyy> naming. NOTHING
+//	                      creates monthly tables any more, so the target month's
+//	                      table must already exist and must carry a unique index
+//	                      over (gps_time, sys_service_id).
 //
 // The defaults above are the LOCAL DEV values, so `go run ./cmd/pgwriter` works
 // on a developer machine with no setup.
@@ -29,6 +34,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -55,11 +62,12 @@ func main() {
 	group := env("CONSUMER_GROUP", "pg-writer")
 	dsn := env("POSTGRES_DSN", "postgres://postgres:root@localhost:5432/atltracking")
 	utcOffset := envInt("PGWRITER_UTC_OFFSET", 330)
+	tableMode := env("TELEMETRY_TABLE_MODE", store.TableDaily)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	st, err := store.New(ctx, dsn, utcOffset)
+	st, err := store.New(ctx, dsn, utcOffset, tableMode)
 	if err != nil {
 		log.Error("postgres init failed", "err", err)
 		os.Exit(1)
@@ -73,7 +81,21 @@ func main() {
 	}
 	defer cl.Close()
 
-	log.Info("pgwriter started", "brokers", brokers, "group", group, "topic", kafkax.TopicTelemetry)
+	// Records that can never be written go here rather than being retried
+	// forever or dropped. Same broker set as the consumer.
+	dlq, err := kafkax.NewProducer(brokers)
+	if err != nil {
+		log.Error("kafka dlq producer init failed", "err", err)
+		os.Exit(1)
+	}
+	defer dlq.Close()
+
+	if st.TableMode() == store.TableMonthly {
+		log.Warn("TELEMETRY_TABLE_MODE=monthly: writing tbl_telemetry_<mmmyy>. " +
+			"Nothing creates monthly tables automatically -- confirm next month's " +
+			"table exists before the month rolls over, or rows will land in the DLQ as 42P01.")
+	}
+	log.Info("pgwriter started", "table_mode", st.TableMode(), "brokers", brokers, "group", group, "topic", kafkax.TopicTelemetry, "dlq", kafkax.TopicDLQ)
 
 	for ctx.Err() == nil {
 		// Poll accumulates up to maxBatchRecords. We bound the wait so a quiet
@@ -96,10 +118,13 @@ func main() {
 			continue
 		}
 
-		if err := writeBatch(ctx, log, st, records); err != nil {
-			// Do NOT commit offsets: the batch will be redelivered and retried.
-			log.Error("batch write failed, will retry via redelivery", "count", len(records), "err", err)
-			continue
+		// Transient failures are retried HERE, holding the batch. Returning and
+		// polling again does NOT get these records back within one session --
+		// see kafkax.RetryBatch.
+		if err := kafkax.RetryBatch(ctx, log, len(records), func() error {
+			return writeBatch(ctx, log, st, dlq, records)
+		}); err != nil {
+			continue // context cancelled; shutting down
 		}
 
 		// Database is durable now; commit Kafka offsets.
@@ -111,26 +136,76 @@ func main() {
 	log.Info("pgwriter stopped cleanly")
 }
 
-func writeBatch(ctx context.Context, log *slog.Logger, st *store.Store, records []*kgo.Record) error {
+// writeBatch writes each record, separating the two kinds of failure.
+//
+// A TRANSIENT failure (database down, deadlock, timeout) returns an error: the
+// batch is not committed and Kafka redelivers it, which is exactly what makes
+// those conditions recover.
+//
+// A PERMANENT failure — a record that will fail identically no matter how often
+// it is retried — is diverted to gps.dlq and skipped. Returning an error for
+// those instead is what took the pipeline down: one device reporting a 2001
+// timestamp aimed the insert at a daily table that did not exist, and the
+// resulting infinite retry stalled the partition for hours, including for the
+// correctly-dated packets queued behind it.
+func writeBatch(ctx context.Context, log *slog.Logger, st *store.Store, dlq *kafkax.Producer, records []*kgo.Record) error {
 	for _, rec := range records {
 		var msg model.TelemetryMessage
 		if err := json.Unmarshal(rec.Value, &msg); err != nil {
-			// A malformed message must not block the partition. In this thin
-			// slice we log and skip; the next increment routes it to gps.dlq.
-			log.Warn("decode failed, skipping (todo: DLQ)", "offset", rec.Offset, "err", err)
+			if dlqErr := toDLQ(ctx, dlq, rec, "decode_failed", err); dlqErr != nil {
+				return dlqErr
+			}
+			log.Warn("decode failed, routed to DLQ", "offset", rec.Offset, "err", err)
 			continue
 		}
 
 		serviceID, err := st.ResolveServiceID(ctx, msg.IMEI)
-		if err != nil {
-			log.Warn("unknown imei, skipping", "imei", msg.IMEI, "err", err)
+		if errors.Is(err, store.ErrUnknownIMEI) {
+			if dlqErr := toDLQ(ctx, dlq, rec, "unknown_imei", err); dlqErr != nil {
+				return dlqErr
+			}
+			log.Warn("unknown imei, routed to DLQ", "imei", msg.IMEI, "offset", rec.Offset)
 			continue
+		}
+		if err != nil {
+			return err // transient lookup failure -> redelivery
 		}
 
 		if err := st.InsertTelemetry(ctx, &msg, serviceID, rec.Value); err != nil {
-			return err // fail the whole batch -> redelivery
+			condition, permanent := store.IsPermanent(err)
+			if !permanent {
+				return err // fail the whole batch -> redelivery
+			}
+			if dlqErr := toDLQ(ctx, dlq, rec, condition, err); dlqErr != nil {
+				return dlqErr
+			}
+			log.Warn("permanent insert failure, routed to DLQ",
+				"condition", condition, "imei", msg.IMEI, "offset", rec.Offset,
+				"gps_time", msg.GPSTime.Format(time.RFC3339), "err", err)
+			continue
 		}
 		log.Info("inserted", "imei", msg.IMEI, "service_id", serviceID, "gps_time", msg.GPSTime.Format(time.RFC3339))
+	}
+	return nil
+}
+
+// toDLQ copies a record to gps.dlq, preserving its key so a device's rejects
+// stay ordered, and recording where it came from and why it was rejected.
+//
+// It publishes synchronously and propagates any failure to the caller, which
+// aborts the batch. Skipping a record whose DLQ copy had not landed would
+// destroy it: the source offset is committed moments later.
+func toDLQ(ctx context.Context, dlq *kafkax.Producer, rec *kgo.Record, reason string, cause error) error {
+	err := dlq.PublishSync(ctx, kafkax.TopicDLQ, string(rec.Key), rec.Value, map[string]string{
+		"dlq_reason":       reason,
+		"dlq_error":        cause.Error(),
+		"dlq_source_topic": rec.Topic,
+		"dlq_source_part":  strconv.FormatInt(int64(rec.Partition), 10),
+		"dlq_source_off":   strconv.FormatInt(rec.Offset, 10),
+		"dlq_at":           time.Now().UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		return fmt.Errorf("dlq publish (offset %d, reason %s): %w", rec.Offset, reason, err)
 	}
 	return nil
 }
